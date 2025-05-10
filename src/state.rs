@@ -1,12 +1,14 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
 use futures::FutureExt;
+use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
-use tracing::error;
+use tracing::{error, info, warn};
 
 use crate::config::{Backend, Config};
 
@@ -53,6 +55,11 @@ impl Pool {
             match TcpStream::connect(sock_addr).await {
                 Ok(connection) => {
                     connection.set_nodelay(true).unwrap();
+                    let sf = SockRef::from(&connection);
+                    info!("keepalive: {:?}", sf.keepalive());
+                    sf.set_keepalive(true).unwrap();
+                    let ka = TcpKeepalive::new().with_time(Duration::from_secs(30));
+                    sf.set_tcp_keepalive(&ka).unwrap();
                     connections.lock().push_back(connection);
                 }
                 Err(err) => {
@@ -69,7 +76,7 @@ impl Pool {
             // that's how you check if a socket is closed
             let mut buf = [0u8; 16];
             if let Some(Ok(0)) = conn.peek(&mut buf).now_or_never() {
-                error!("connection was closed by remote - try next connection");
+                warn!("connection was closed by remote - try next connection");
             } else {
                 return Ok(conn);
             }

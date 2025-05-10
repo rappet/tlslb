@@ -660,6 +660,7 @@ dependencies = [
  "futures",
  "parking_lot",
  "serde",
+ "socket2",
  "tls-parser",
  "tokio",
  "toml",
