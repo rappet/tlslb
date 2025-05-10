@@ -5,13 +5,13 @@ mod state;
 use std::{
     fs,
     net::{SocketAddr, SocketAddrV6},
-    path::PathBuf,
     sync::Arc,
     time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
-use argh::FromArgs;
+use clap::Parser;
+use tlslb::cli::Cli;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy},
     net::{TcpListener, TcpStream, lookup_host},
@@ -21,21 +21,13 @@ use tracing::{Level, info, instrument};
 
 use crate::{config::Config, sni::extract_sni_from_header, state::State};
 
-#[derive(FromArgs, Debug)]
-/// TLS Load Balancer server
-pub struct Opts {
-    /// path to config file
-    #[argh(option)]
-    pub config_file: PathBuf,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(Level::DEBUG)
         .init();
 
-    let opts: Opts = argh::from_env();
+    let opts: Cli = Cli::parse();
     let opts = Arc::new(opts);
 
     let config: Config = toml::from_str(&fs::read_to_string(&opts.config_file)?)?;
