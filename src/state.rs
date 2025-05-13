@@ -56,7 +56,6 @@ impl Pool {
                 Ok(connection) => {
                     connection.set_nodelay(true).unwrap();
                     let sf = SockRef::from(&connection);
-                    info!("keepalive: {:?}", sf.keepalive());
                     sf.set_keepalive(true).unwrap();
                     let ka = TcpKeepalive::new().with_time(Duration::from_secs(30));
                     sf.set_tcp_keepalive(&ka).unwrap();
