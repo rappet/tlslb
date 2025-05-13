@@ -80,7 +80,7 @@ async fn handle_client_connection(mut client_stream: TcpStream, state: Arc<State
 
     let (mut client_read, mut client_write) = client_stream.into_split();
 
-    let mut server_stream = state
+    let (mut server_stream, server_ref) = state
         .pools
         .get(&sni)
         .context("domain is not configured")?
@@ -128,6 +128,9 @@ async fn handle_client_connection(mut client_stream: TcpStream, state: Arc<State
         }
     )?;
 
+    // reset counters
+    drop(server_ref);
+
     info!("finish: {:?}", connection_start.elapsed());
 
     Ok(())
@@ -136,7 +139,7 @@ async fn handle_client_connection(mut client_stream: TcpStream, state: Arc<State
 #[instrument(err, ret, level = Level::DEBUG)]
 async fn lookup_dns_v6(sni: &str) -> Result<SocketAddrV6> {
     info!("looking up");
-    let addrs: Vec<_> = lookup_host(format!("{}:443", sni))
+    let addrs: Vec<_> = lookup_host(format!("{sni}:443"))
         .await
         .with_context(|| format!("no DNS entry for {sni:?}"))?
         .collect();
