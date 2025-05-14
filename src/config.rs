@@ -23,4 +23,7 @@ pub struct Backend {
     /// Overwrites the setting from the frontend
     #[serde(default)]
     pub terminate_tls_on_error: Option<bool>,
+    /// Count of connections that will be added to the pool in advance
+    #[serde(default)]
+    pub preconnect_count: Option<usize>,
 }

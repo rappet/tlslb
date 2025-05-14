@@ -81,13 +81,15 @@ impl Pool {
             .map(|addr| Arc::new(BackendState::new(*addr)))
             .collect();
 
+        let preconnect_count = config.preconnect_count.unwrap_or(0);
+
         let pool = Self {
             backends,
             slots: Arc::new(Default::default()),
             config,
         };
 
-        for _ in 0..3 {
+        for _ in 0..preconnect_count {
             pool.request_connection();
         }
 
