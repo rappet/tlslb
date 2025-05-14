@@ -5,8 +5,14 @@ use serde::Deserialize;
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
-    pub frontends: HashMap<String, Frontend>,
+    pub frontends: Frontends,
     pub backends: HashMap<String, Arc<Backend>>,
+}
+
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub struct Frontends {
+    pub https: Frontend,
 }
 
 #[derive(Deserialize, Debug, PartialEq)]

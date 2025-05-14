@@ -35,10 +35,10 @@ async fn main() -> Result<()> {
     info!("{config:?}");
 
     let config = Arc::new(config);
-    let state = Arc::new(State::new(config));
+    let state = Arc::new(State::new(Arc::clone(&config)));
 
-    let sock_addr: SocketAddr = "[::]:8443".parse().unwrap();
-    let listener = TcpListener::bind(sock_addr).await.unwrap();
+    let sock_addr: SocketAddr = config.frontends.https.listen_address;
+    let listener = TcpListener::bind(sock_addr).await.context("failed to bind https socket")?;
 
     while let Ok((stream, _addr)) = listener.accept().await {
         let state = Arc::clone(&state);
