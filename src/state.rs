@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     net::SocketAddr,
     sync::{
         Arc,
@@ -11,8 +11,8 @@ use std::{
 use anyhow::{Context, Result};
 use futures::FutureExt;
 use socket2::{SockRef, TcpKeepalive};
-use tokio::net::TcpStream;
-use tracing::{error, warn};
+use tokio::net::{TcpStream, lookup_host};
+use tracing::{debug, error, warn};
 
 use crate::config::{Backend, Config};
 
@@ -21,14 +21,14 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(config: Arc<Config>) -> Self {
+    pub async fn new(config: Arc<Config>) -> Result<Self> {
         let mut pools = HashMap::new();
 
         for (domain, backend) in &config.backends {
-            pools.insert(domain.clone(), Pool::new(Arc::clone(backend)));
+            pools.insert(domain.clone(), Pool::new(Arc::clone(backend)).await?);
         }
 
-        Self { pools }
+        Ok(Self { pools })
     }
 }
 
@@ -52,18 +52,25 @@ pub struct ConnectionRef {
 
 impl ConnectionRef {
     pub fn new(backend_state: Arc<BackendState>) -> Self {
-        backend_state
+        let connections = backend_state
             .open_connections
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let backend_socket_addr = backend_state.addr;
+        debug!(connections, %backend_socket_addr, "opened connection");
         Self { backend_state }
     }
 }
 
 impl Drop for ConnectionRef {
     fn drop(&mut self) {
-        self.backend_state
+        let connections = self
+            .backend_state
             .open_connections
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        let backend_socket_addr = self.backend_state.addr;
+        debug!(connections, %backend_socket_addr, "closed connection");
     }
 }
 
@@ -74,9 +81,13 @@ pub struct Pool {
 }
 
 impl Pool {
-    pub fn new(config: Arc<Backend>) -> Self {
-        let backends = config
-            .addresses
+    pub async fn new(config: Arc<Backend>) -> Result<Self> {
+        let mut addresses = BTreeSet::new();
+        for host in &config.addresses {
+            addresses.extend(lookup_host(host).await?);
+        }
+
+        let backends = addresses
             .iter()
             .map(|addr| Arc::new(BackendState::new(*addr)))
             .collect();
@@ -93,7 +104,7 @@ impl Pool {
             pool.request_connection();
         }
 
-        pool
+        Ok(pool)
     }
 
     pub fn request_connection(&self) {
