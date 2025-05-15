@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
 #[instrument(err, skip_all)]
 async fn handle_client_connection(mut client_stream: TcpStream, state: Arc<State>) -> Result<()> {
     let connection_start = Instant::now();
-    let mut buffer = vec![0u8; 4096];
+    let mut buffer = vec![0u8; 16384];
     let len = client_stream
         .read(&mut buffer)
         .await
