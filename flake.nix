@@ -25,5 +25,7 @@
         tlslb = nixpkgs.legacyPackages.${system}.callPackage ./tlslb.nix { };
         default = self.packages.${system}.tlslb;
       });
+
+      nixosModules.tlslb = import ./module.nix;
     };
 }
