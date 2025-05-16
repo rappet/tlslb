@@ -1,5 +1,4 @@
 mod config;
-mod sni;
 mod state;
 
 use std::{
@@ -11,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use tlslb::cli::Cli;
+use tlslb::{cli::Cli, tls::parse_tls_client_hello};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy},
     net::{TcpListener, TcpStream, lookup_host},
@@ -19,7 +18,7 @@ use tokio::{
 };
 use tracing::{Level, info, instrument};
 
-use crate::{config::Config, sni::extract_sni_from_header, state::State};
+use crate::{config::Config, state::State};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,10 +60,13 @@ async fn handle_client_connection(mut client_stream: TcpStream, state: Arc<State
     buffer.truncate(len);
 
     let sni = {
-        let (_, sni_opt) = extract_sni_from_header(&buffer)
+        let (_, client_hello) = parse_tls_client_hello(&buffer)
             .map_err(|err| anyhow::Error::msg(err.to_string()))
             .context("failed parsing TLS header")?;
-        sni_opt.context("TLS header does not contain SNI")?
+        client_hello
+            .context("TLS header does not contain valid client hello")?
+            .sni
+            .context("TLS client hello does not contain SNI")?
     };
     info!("sni extracted: {:?}", connection_start.elapsed());
 
@@ -84,7 +86,7 @@ async fn handle_client_connection(mut client_stream: TcpStream, state: Arc<State
 
     let (mut server_stream, server_ref) = state
         .pools
-        .get(&sni)
+        .get(sni)
         .context("domain is not configured")?
         .get_connection()
         .await?;
