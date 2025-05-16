@@ -17,15 +17,15 @@
       eachSystem = nixpkgs.lib.genAttrs (import systems);
     in
     {
-      overlays.default = import ./overlay.nix;
+      overlays.default = import ./nix/overlay.nix;
 
       formatter = eachSystem (system: nixpkgs.legacyPackages.${system}.nixfmt-rfc-style);
 
       packages = eachSystem (system: {
-        tlslb = nixpkgs.legacyPackages.${system}.callPackage ./tlslb.nix { };
+        tlslb = nixpkgs.legacyPackages.${system}.callPackage ./nix/tlslb.nix { };
         default = self.packages.${system}.tlslb;
       });
 
-      nixosModules.tlslb = import ./module.nix;
+      nixosModules.tlslb = import ./nix/module.nix;
     };
 }
