@@ -1,0 +1,27 @@
+[package]
+name = "tls-client-hello-parser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arbitrary = { version = "1.4.1", optional = true }
+faster-hex = { version = "0.10.0", default-features = false }
+heapless = "0.8.0"
+nom7 = {  version = "7", package = "nom", default-features = false }
+sha2 = "0.10.9"
+thiserror = "2.0.12"
+
+[dev-dependencies]
+criterion = { version = "0.6.0", features = ["html_reports"] }
+pretty_assertions = "1.4.1"
+
+[[bench]]
+name = "parse_tls_client_hello"
+harness = false
+
+[[bench]]
+name = "calculate_ja4"
+harness = false
+
+[profile.bench]
+debug = true
