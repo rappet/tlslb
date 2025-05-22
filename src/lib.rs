@@ -4,4 +4,3 @@
 #![warn(clippy::nursery)]
 
 pub mod cli;
-pub mod tls;

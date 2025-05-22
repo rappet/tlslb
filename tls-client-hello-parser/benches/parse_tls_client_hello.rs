@@ -1,12 +1,7 @@
-
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use mimalloc::MiMalloc;
-use tlslb::tls::parse_tls_client_hello;
-
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+use tls_client_hello_parser::parse_tls_client_hello;
 
 const HEADER: &[u8] = &[
     0x16, 0x3, 0x1, 0x6, 0x28, 0x1, 0x0, 0x6, 0x24, 0x3, 0x3, 0xc3, 0xf0, 0xe7, 0xdb, 0x39, 0x40,

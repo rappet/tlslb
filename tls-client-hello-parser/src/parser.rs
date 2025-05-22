@@ -1,91 +1,181 @@
-use faster_hex::hex_encode;
-use sha2::{Digest, Sha256};
-use tinyvec::TinyVec;
-use tls_parser::{
-    IResult, SNIType, TlsExtension, TlsMessage, TlsMessageHandshake, TlsPlaintext,
-    nom::{
-        combinator::complete,
-        multi::{length_data, many0},
-        number::streaming::be_u16,
-    },
-    parse_tls_extensions, parse_tls_plaintext,
-};
-use tracing::warn;
+use core::fmt::Write;
 
-use crate::tls::ClientHello;
+use faster_hex::hex_encode;
+use heapless::String;
+use nom7::{
+    IResult, InputLength, Parser,
+    bytes::streaming::take,
+    combinator::{complete, cond, map, map_parser, opt, verify},
+    error::{ErrorKind, ParseError, make_error},
+    multi::length_data,
+    number::{
+        Endianness,
+        complete::{u8, u16},
+        streaming::{be_u8, be_u16, be_u24},
+    },
+};
+use tinyvec::{Array, ArrayVec};
+
+use crate::{ClientHello, ja4::hash12};
 
 /// Extracts useful metadata out of a TLS client hello
 ///
 /// # Errors
 /// If the input is malformed or not complete
 pub fn parse_tls_client_hello(buffer: &[u8]) -> IResult<&[u8], Option<ClientHello>> {
-    let (rest, header) = parse_tls_plaintext(buffer)?;
-    Ok((rest, extract_handshake(header)))
+    let (rest, client_hello) = extract_metadata_from_packet(buffer)?;
+    Ok((rest, Some(client_hello)))
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn extract_handshake(header: TlsPlaintext) -> Option<ClientHello> {
-    for msg in &header.msg {
-        if let TlsMessage::Handshake(TlsMessageHandshake::ClientHello(hello)) = &msg {
-            let mut client_hello = ClientHello {
-                tls_version: hello.version.0,
-                sni: None,
-                cipher_suites: hello.ciphers.iter().map(|c| c.0).collect(),
-                extensions: TinyVec::default(),
-                signature_algorithms: TinyVec::default(),
-                alpn: TinyVec::default(),
-                ja4: String::new(),
-            };
+pub const MAX_RECORD_LEN: u16 = (1 << 14) + 256;
 
-            if let Some(ext) = hello.ext {
-                let (_i, extension_ids) = parse_tls_extension_ids(ext).ok()?;
-                client_hello.extensions.extend_from_slice(&extension_ids);
-                let (_i, extensions) = parse_tls_extensions(ext).ok()?;
-                for extension in extensions {
-                    extract_extension_metadata(extension, &mut client_hello);
-                }
-            }
+/// Parse one packet only, as plaintext
+/// A single record can contain multiple messages, they must share the same record type
+fn extract_metadata_from_packet(i: &[u8]) -> IResult<&[u8], ClientHello> {
+    let (i, record_type) = u8(i)?;
+    let (i, _tls_version) = u16(Endianness::Big)(i)?;
+    let (i, record_header_length) = u16(Endianness::Big)(i)?;
 
-            // TODO SNI is IP
+    if record_header_length > MAX_RECORD_LEN {
+        return Err(nom7::Err::Error(make_error(i, ErrorKind::TooLarge)));
+    }
+    let (i, client_hello) = map_parser(take(record_header_length as usize), |i| {
+        extract_metadata_from_tls_record_with_header(i, record_type)
+    })(i)?;
+    Ok((i, client_hello))
+}
 
-            let mut cipher_suites_sorted = client_hello.cipher_suites.clone();
-            cipher_suites_sorted.sort_unstable();
-            let cipher_suited_sorted_formatted = u16_slice_to_hex(&cipher_suites_sorted);
+/// Given data and a TLS record header, parse content.
+///
+/// A record can contain multiple messages (with the same type).
+///
+/// Note that message length is checked (not required for parser safety, but for
+/// strict protocol conformance).
+#[rustfmt::skip]
+#[allow(clippy::trivially_copy_pass_by_ref)] // TlsRecordHeader is only 6 bytes, but we prefer not breaking current API
+fn extract_metadata_from_tls_record_with_header<'i>(i:&'i [u8], record_type: u8) -> IResult<&'i [u8], ClientHello<'i>> {
+    match record_type {
+        // handshake
+        0x16        => complete(extract_metadata_from_tls_message_handshake)(i),
+        _                               => Err(nom7::Err::Error(make_error(i, ErrorKind::Switch)))
+    }
+}
 
-            let mut extensions_sorted = client_hello.extensions.clone();
-            extensions_sorted.sort_unstable();
-            extensions_sorted.retain(|v| ![0x0, 0x10].contains(v));
-            let extensions_sorted_formatted = u16_slice_to_hex(&extensions_sorted);
+/// Parse a TLS handshake message
+fn extract_metadata_from_tls_message_handshake(i: &[u8]) -> IResult<&[u8], ClientHello> {
+    let (i, ht) = be_u8(i)?;
+    let (i, hl) = be_u24(i)?;
+    let (i, raw_msg) = take(hl)(i)?;
+    let (_, client_hello) = match ht {
+        // client hello
+        0x01 => extract_metadata_from_tls_handshake_client_hello(raw_msg),
+        _ => Err(nom7::Err::Error(make_error(i, ErrorKind::Switch))),
+    }?;
+    Ok((i, client_hello))
+}
 
-            let signatures_formatted = u16_slice_to_hex(&client_hello.signature_algorithms);
+fn extract_metadata_from_tls_handshake_client_hello(i: &[u8]) -> IResult<&[u8], ClientHello> {
+    let (i, version) = be_u16(i)?;
+    let (i, _random) = take(32usize)(i)?;
+    let (i, sidlen) = verify(be_u8, |&n| n <= 32)(i)?;
+    let (i, _sid) = cond(sidlen > 0, take(sidlen as usize))(i)?;
+    let (i, ciphers_len) = be_u16(i)?;
+    let (i, ciphers) = parse_cipher_suites(i, ciphers_len as usize)?;
+    let (i, comp_len) = be_u8(i)?;
+    let (i, _comp) = parse_compressions_algs(i, comp_len as usize)?;
+    let (i, ext) = opt(complete(length_data(be_u16)))(i)?;
+    //let content = TlsClientHelloContents::new(version, random, sid, ciphers, comp, ext);
 
-            let mut hash2_input: TinyVec<[u8; 256]> = TinyVec::from(extensions_sorted_formatted.as_slice());
-            hash2_input.push(b'_');
-            hash2_input.extend_from_slice(&signatures_formatted);
+    let mut client_hello = ClientHello {
+        tls_version: version,
+        sni: None,
+        cipher_suites: ciphers,
+        extensions: ArrayVec::new(),           //todo
+        signature_algorithms: ArrayVec::new(), //todo!(),
+        alpn: ArrayVec::new(),                 // TODO
+        ja4: String::new(),                    // todo!(),
+    };
 
-            client_hello.ja4 = format!(
-                "t{}d{:02}{:02}{}_{}_{}",
-                str::from_utf8(&format_version(client_hello.tls_version)).expect("is utf8"),
-                client_hello.cipher_suites.len(),
-                client_hello.extensions.len(),
-                client_hello
-                    .alpn
-                    .first()
-                    .map_or_else(|| "00".to_string(), |&alpn| format_alpn(alpn)),
-                str::from_utf8(&hash12(&cipher_suited_sorted_formatted)).expect("is utf8"),
-                str::from_utf8(&hash12(&hash2_input)).expect("is utf8"),
-            );
+    if let Some(mut ext) = ext {
+        let (_i, extension_ids) = parse_tls_extension_ids(ext)?;
+        client_hello.extensions.extend_from_slice(&extension_ids);
 
-            return Some(client_hello);
+        while let Ok(v) = complete(parse_tls_extension_header)(ext) {
+            ext = v.0;
+            let (extension_id, extension_data) = v.1;
+            extract_extension_metadata(extension_id, extension_data, &mut client_hello);
         }
     }
 
-    None
+    // TODO SNI is IP
+
+    let mut cipher_suites_sorted = client_hello.cipher_suites;
+    cipher_suites_sorted.sort_unstable();
+    let cipher_suited_sorted_formatted = u16_slice_to_hex(&cipher_suites_sorted);
+
+    let mut extensions_sorted = client_hello.extensions;
+    extensions_sorted.sort_unstable();
+    extensions_sorted.retain(|v| ![0x0, 0x10].contains(v));
+    let extensions_sorted_formatted = u16_slice_to_hex(&extensions_sorted);
+
+    let signatures_formatted = u16_slice_to_hex(&client_hello.signature_algorithms);
+
+    let mut hash2_input: ArrayVec<[u8; 256]> = ArrayVec::from_iter(extensions_sorted_formatted);
+    hash2_input.push(b'_');
+    hash2_input.extend_from_slice(&signatures_formatted);
+
+    write!(
+        &mut client_hello.ja4,
+        "t{}d{:02}{:02}{}_{}_{}",
+        str::from_utf8(&format_version(client_hello.tls_version)).expect("is utf8"),
+        client_hello.cipher_suites.len(),
+        client_hello.extensions.len(),
+        client_hello
+            .alpn
+            .first()
+            .map_or_else(|| "00".try_into().unwrap(), |&alpn| format_alpn(alpn)),
+        str::from_utf8(&hash12(&cipher_suited_sorted_formatted)).expect("is utf8"),
+        str::from_utf8(&hash12(&hash2_input)).expect("is utf8"),
+    )
+    .unwrap();
+
+    Ok((i, client_hello))
+}
+
+pub(crate) fn parse_tls_extension_header(i: &[u8]) -> IResult<&[u8], (u16, &[u8])> {
+    let (i, ext_type) = be_u16(i)?;
+    let (i, ext_data) = length_data(be_u16)(i)?;
+    Ok((i, (ext_type, ext_data)))
+}
+
+pub(crate) fn parse_cipher_suites(i: &[u8], len: usize) -> IResult<&[u8], ArrayVec<[u16; 30]>> {
+    if len == 0 {
+        return Ok((i, ArrayVec::new()));
+    }
+    if len % 2 == 1 || len > i.len() {
+        return Err(nom7::Err::Error(make_error(i, ErrorKind::LengthValue)));
+    }
+    let v = (i[..len])
+        .chunks(2)
+        .map(|chunk| u16::from(chunk[0]) << 8 | u16::from(chunk[1]))
+        .collect();
+    Ok((&i[len..], v))
+}
+
+pub(crate) fn parse_compressions_algs(i: &[u8], len: usize) -> IResult<&[u8], ArrayVec<[u8; 32]>> {
+    if len == 0 {
+        return Ok((i, ArrayVec::new()));
+    }
+    if len > i.len() {
+        return Err(nom7::Err::Error(make_error(i, ErrorKind::LengthValue)));
+    }
+    let v = i[..len].iter().copied().collect();
+    Ok((&i[len..], v))
 }
 
 /// Converts values to a hex byte string
-fn u16_slice_to_hex(data: &[u16]) -> TinyVec<[u8; 128]> {
-    let mut out = TinyVec::with_capacity(data.len() * 5);
+fn u16_slice_to_hex(data: &[u16]) -> ArrayVec<[u8; 256]> {
+    let mut out = ArrayVec::new();
     for v in data {
         let bytes = u16::to_be_bytes(*v);
         let mut hex = [0u8; 4];
@@ -112,73 +202,218 @@ const fn format_version(v: u16) -> [u8; 2] {
     }
 }
 
-fn format_alpn(alpn: &[u8]) -> String {
+fn format_alpn(alpn: &[u8]) -> String<2> {
     if alpn.len() > 2 {
         let alpn_bytes = [alpn[0], alpn[alpn.len() - 1]];
         if alpn_bytes.iter().all(u8::is_ascii) {
-            str::from_utf8(&alpn_bytes).unwrap().to_owned()
+            str::from_utf8(&alpn_bytes).unwrap().try_into().unwrap()
         } else {
-            "99".to_string()
+            "99".try_into().unwrap()
         }
     } else if alpn.iter().all(u8::is_ascii) {
-        str::from_utf8(alpn).unwrap().to_owned()
+        str::from_utf8(alpn).unwrap().try_into().unwrap()
     } else {
-        "99".to_owned()
+        "99".try_into().unwrap()
     }
 }
 
-fn hash12(data: &[u8]) -> [u8; 12] {
-    let hashed = Sha256::digest(data);
-    let mut hex = [0u8; 12];
-    hex_encode(&hashed[..6], &mut hex[..]).expect("Should not fail");
-    hex
-}
+fn extract_extension_metadata<'a>(
+    extension_id: u16,
+    extension_data: &'a [u8],
+    client_hello: &mut ClientHello<'a>,
+) -> Option<()> {
+    match extension_id {
+        // SNI
+        0 => {
+            let (_i, sni) = parse_tls_extension_sni_content(extension_data).ok()?;
 
-fn extract_extension_metadata<'a>(extension: TlsExtension<'a>, client_hello: &mut ClientHello<'a>) {
-    match extension {
-        TlsExtension::SNI(sni) => {
-            for (sni_type, sni_content) in sni {
-                if sni_type == SNIType::HostName {
-                    if let Ok(sni_content_str) = std::str::from_utf8(sni_content) {
+            for entry in sni {
+                if let SniEntry::HostName(host_name) = entry {
+                    if let Ok(sni_content_str) = core::str::from_utf8(host_name) {
                         client_hello.sni = Some(sni_content_str);
                     }
                 }
             }
         }
-        TlsExtension::ALPN(alpn) => {
+        // Signature Algorithms
+        13 => {
+            let (_i, signature_algorithms): (_, ArrayVec<[_; 30]>) = map_parser(
+                length_data(be_u16::<_, ()>),
+                many0_tiny(complete(be_u16)),
+            )(extension_data)
+            .ok()?;
+            client_hello
+                .signature_algorithms
+                .extend_from_slice(&signature_algorithms);
+        }
+        // ALPN
+        16 => {
+            let (_i, alpn): (_, ArrayVec<[_; 4]>) = map_parser(
+                length_data(be_u16::<_, ()>),
+                many0_tiny(complete(length_data(be_u8))),
+            )(extension_data)
+            .ok()?;
             client_hello.alpn.extend_from_slice(&alpn);
         }
-        TlsExtension::EncryptedServerName { .. } => {
-            warn!("got ESNI :(");
-        }
-        TlsExtension::SignatureAlgorithms(algorithms) => client_hello
-            .signature_algorithms
-            .extend_from_slice(&algorithms),
-        TlsExtension::SupportedVersions(versions) => {
-            if let Some(version) = versions.iter().map(|v| v.0).max() {
-                client_hello.tls_version = version;
+        // supported versions
+        43 => {
+            let (_i, v) =
+                parse_tls_extension_supported_versions_content_and_extract_highest(extension_data)
+                    .ok()?;
+            if let Some(v) = v {
+                client_hello.tls_version = v;
             }
         }
-        _ => {}
+        // ESNI
+        0xffce => {
+            //warn!("got ESNI :(");
+        }
+        _ => {
+            // we do not care
+        }
+    }
+
+    Some(())
+}
+
+#[derive(Debug, Default)]
+pub enum SniEntry<'a> {
+    HostName(&'a [u8]),
+    #[default]
+    Other,
+}
+
+// struct {
+//     ServerName server_name_list<1..2^16-1>
+// } ServerNameList;
+fn parse_tls_extension_sni_content(i: &[u8]) -> IResult<&[u8], ArrayVec<[SniEntry; 4]>> {
+    if i.is_empty() {
+        // special case: SNI extension in server can be empty
+        return Ok((i, ArrayVec::new()));
+    }
+    let (i, list_len) = be_u16(i)?;
+    let (i, v) = map_parser(
+        take(list_len),
+        many0_tiny(complete(parse_tls_extension_sni_hostname)),
+    )(i)?;
+    Ok((i, v))
+}
+
+// struct {
+//     NameType name_type;
+//     select (name_type) {
+//         case host_name: HostName;
+//     } name;
+// } ServerName;
+//
+// enum {
+//     host_name(0), (255)
+// } NameType;
+//
+// opaque HostName<1..2^16-1>;
+fn parse_tls_extension_sni_hostname(i: &[u8]) -> IResult<&[u8], SniEntry> {
+    let (i, t) = u8(i)?;
+    let (i, v) = length_data(be_u16)(i)?;
+
+    let entry = match t {
+        0 => SniEntry::HostName(v),
+        _ => SniEntry::Other,
+    };
+    Ok((i, entry))
+}
+
+fn parse_tls_extension_ids(i: &[u8]) -> IResult<&[u8], ArrayVec<[u16; 30]>> {
+    many0_tiny(map(complete(parse_tls_extension_header), |(id, _rest)| id))(i)
+}
+
+// TLS 1.3 draft 23
+//       struct {
+//           select (Handshake.msg_type) {
+//               case client_hello:
+//                    ProtocolVersion versions<2..254>;
+//
+//               case server_hello: /* and HelloRetryRequest */
+//                    ProtocolVersion selected_version;
+//           };
+//       } SupportedVersions;
+// XXX the content depends on the current message type
+// XXX first case has length 1 + 2*n, while the second case has length 2
+fn parse_tls_extension_supported_versions_content_and_extract_highest(
+    i: &[u8],
+) -> IResult<&[u8], Option<u16>> {
+    let ext_len = i.len();
+    if ext_len == 2 {
+        be_u16(i).map(|(i, v)| (i, Some(v)))
+    } else {
+        let (i, _) = be_u8(i)?;
+        if ext_len == 0 {
+            return Err(nom7::Err::Error(make_error(i, ErrorKind::Verify)));
+        }
+        let (i, l) = map_parser(take(ext_len - 1), parse_tls_versions_and_extract_highest)(i)?;
+        Ok((i, l))
     }
 }
 
-fn parse_tls_extension_ids(i: &[u8]) -> IResult<&[u8], Vec<u16>> {
-    many0(complete(parse_tls_extension_header))(i)
+pub(crate) fn parse_tls_versions_and_extract_highest(i: &[u8]) -> IResult<&[u8], Option<u16>> {
+    let len = i.len();
+    if len == 0 {
+        return Ok((i, None));
+    }
+    if len % 2 == 1 || len > i.len() {
+        return Err(nom7::Err::Error(make_error(i, ErrorKind::LengthValue)));
+    }
+    let v = (i[..len]).chunks(2).fold(0, |v, chunk| {
+        u16::max(v, u16::from(chunk[0]) << 8 | u16::from(chunk[1]))
+    });
+    Ok((&i[len..], Some(v)))
 }
 
-fn parse_tls_extension_header(i: &[u8]) -> IResult<&[u8], u16> {
-    let (i, ext_type) = be_u16(i)?;
-    let (i, _ext_data) = length_data(be_u16)(i)?;
-    // TODO: use ext_data later
-    Ok((i, ext_type))
+/// "Inspired" from nom
+///
+/// Repeats the embedded parser, gathering the results in a `Vec`.
+///
+/// This stops on [`nom7::Err::Error`] and returns the results that were accumulated. To instead chain an error up, see
+/// [`cut`][crate::combinator::cut].
+///
+/// # Arguments
+/// * `f` The parser to apply.
+///
+/// *Note*: if the parser passed in accepts empty inputs (like `alpha0` or `digit0`), `many0` will
+/// return an error, to prevent going into an infinite loop
+fn many0_tiny<I, O, E, F>(mut f: F) -> impl FnMut(I) -> IResult<I, ArrayVec<O>, E>
+where
+    I: Clone + InputLength,
+    F: Parser<I, O::Item, E>,
+    E: ParseError<I>,
+    O: Array,
+    O::Item: Default,
+{
+    move |mut i: I| {
+        let mut acc = ArrayVec::new();
+        loop {
+            let len = i.input_len();
+            match f.parse(i.clone()) {
+                Err(nom7::Err::Error(_)) => return Ok((i, acc)),
+                Err(e) => return Err(e),
+                Ok((i1, o)) => {
+                    // infinite loop check: the parser must always consume
+                    if i1.input_len() == len {
+                        return Err(nom7::Err::Error(E::from_error_kind(i, ErrorKind::Many0)));
+                    }
+
+                    i = i1;
+                    acc.push(o);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::tls::{ClientHello, parse_tls_client_hello, parser::u16_slice_to_hex};
+    use crate::{ClientHello, parse_tls_client_hello, parser::u16_slice_to_hex};
 
     #[test]
     fn test_parse_tls_header() {
@@ -302,20 +537,22 @@ mod tests {
                 0xc02f, 0x009e, 0xc024, 0xc028, 0x006b, 0xc023, 0xc027, 0x0067, 0xc00a, 0xc014,
                 0x0039, 0xc009, 0xc013, 0x0033, 0x009d, 0x009c, 0x003d, 0x003c, 0x0035, 0x002f,
             ]
-            .as_slice()
-            .into(),
+            .into_iter()
+            .collect(),
             extensions: [0xff01, 0, 11, 10, 16, 22, 23, 49, 13, 43, 45, 51]
-                .as_slice()
-                .into(),
+                .into_iter()
+                .collect(),
             signature_algorithms: [
                 0x0905, 0x0906, 0x0904, 0x0403, 0x0503, 0x0603, 0x0807, 0x0808, 0x081a, 0x081b,
                 0x081c, 0x0809, 0x080a, 0x080b, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601,
                 0x0303, 0x0301, 0x0302, 0x0402, 0x0502, 0x0602,
             ]
-            .as_slice()
-            .into(),
-            alpn: ["h2".as_bytes(), "http/1.1".as_bytes()].as_slice().into(),
-            ja4: "t13d3012h2_1d37bd780c83_882d495ac381".to_string(),
+            .into_iter()
+            .collect(),
+            alpn: [b"h2".as_slice(), b"http/1.1".as_slice()]
+                .into_iter()
+                .collect(),
+            ja4: "t13d3012h2_1d37bd780c83_882d495ac381".try_into().unwrap(),
         };
 
         assert_eq!(
@@ -329,5 +566,16 @@ mod tests {
         let input = &[0x1234, 0x5678, 0x9abc];
         let output = u16_slice_to_hex(input);
         assert_eq!(output.as_slice(), b"1234,5678,9abc");
+    }
+
+    #[test]
+    fn test_empty_tls_version() {
+        let input = [
+            22, 0, 1, 0, 96, 1, 0, 0, 72, 72, 72, 72, 72, 72, 72, 72, 72, 0, 0, 0, 0, 0, 100, 0, 0,
+            0, 0, 0, 5, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 16, 0, 0,
+            0, 0, 0, 0, 0, 43, 0, 1, 0, 96, 1, 0, 72, 72, 72, 72, 72, 72, 72, 72, 0, 0, 0, 0, 0, 0,
+            0, 4, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 85, 0, 0, 0, 0, 0, 0, 72, 0,
+        ];
+        let _ = parse_tls_client_hello(&input[..]);
     }
 }

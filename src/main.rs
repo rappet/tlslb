@@ -11,7 +11,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use mimalloc::MiMalloc;
-use tlslb::{cli::Cli, tls::parse_tls_client_hello};
+use tlslb::cli::Cli;
+use tls_client_hello_parser::parse_tls_client_hello;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy},
     net::{TcpListener, TcpStream, lookup_host},
