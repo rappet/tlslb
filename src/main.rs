@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use mimalloc::MiMalloc;
-use tls_client_hello_parser::ClientHello;
+use tls_client_hello_parser::{ClientHello, Ja4Fingerprint};
 use tlslb::cli::Cli;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy},
@@ -69,6 +69,16 @@ async fn handle_client_connection(mut client_stream: TcpStream, state: Arc<State
     let sni = tls_client_hello
         .sni()
         .context("TLS client hello does not contain SNI")?;
+    let ja4_fingerprint = Ja4Fingerprint::calculate(&tls_client_hello);
+    let peer_addr = client_stream.peer_addr()?;
+
+    info!(
+        sni,
+        ja4 = ja4_fingerprint.as_ref(),
+        ?peer_addr,
+        "got TLS connection"
+    );
+
     info!("sni extracted: {:?}", connection_start.elapsed());
 
     /*
