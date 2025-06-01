@@ -5,6 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
+ipnet = "2.11.0"
+prefix-trie = "0.7.0"
 thiserror = "2.0.12"
 
 [features]
