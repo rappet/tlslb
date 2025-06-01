@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use futures::FutureExt;
+use ip_database::IpDatabase;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::{TcpStream, lookup_host};
 use tracing::{debug, error, warn};
@@ -18,6 +19,7 @@ use crate::config::{Backend, Config};
 
 pub struct State {
     pub pools: HashMap<String, Pool>,
+    pub ip_to_asn_database: IpDatabase,
 }
 
 impl State {
@@ -28,7 +30,15 @@ impl State {
             pools.insert(domain.clone(), Pool::new(Arc::clone(backend)).await?);
         }
 
-        Ok(Self { pools })
+        let mut ip_to_asn_database = IpDatabase::new();
+        ip_to_asn_database
+            .load_routing_table_txt(&include_bytes!("./table.txt")[..])
+            .unwrap();
+
+        Ok(Self {
+            pools,
+            ip_to_asn_database,
+        })
     }
 }
 

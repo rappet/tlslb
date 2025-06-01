@@ -71,11 +71,17 @@ async fn handle_client_connection(mut client_stream: TcpStream, state: Arc<State
         .context("TLS client hello does not contain SNI")?;
     let ja4_fingerprint = Ja4Fingerprint::calculate(&tls_client_hello);
     let peer_addr = client_stream.peer_addr()?;
+    let as_number = state
+        .ip_to_asn_database
+        .lookup_ip(peer_addr.ip())
+        .map(|v| v.asn())
+        .unwrap_or(1337);
 
     info!(
         sni,
         ja4 = ja4_fingerprint.as_ref(),
         ?peer_addr,
+        as_number,
         "got TLS connection"
     );
 

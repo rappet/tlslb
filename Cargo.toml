@@ -23,6 +23,7 @@ toml = "0.8.20"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 tls-client-hello-parser = { path = "./tls-client-hello-parser" }
+ip-database = { path = "./ip-database" }
 
 [profile.release]
 opt-level = 3
