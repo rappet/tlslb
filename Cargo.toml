@@ -1,5 +1,5 @@
 [workspace]
-members = ["tls-client-hello-parser", "tls-client-hello-parser/fuzz"]
+members = [ "ip-database","tls-client-hello-parser", "tls-client-hello-parser/fuzz"]
 
 [package]
 name = "tlslb"

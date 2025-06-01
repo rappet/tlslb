@@ -2,6 +2,7 @@
 name = "tls-client-hello-parser"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 arbitrary = { version = "1.4.1", optional = true }
